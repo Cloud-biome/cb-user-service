@@ -1,0 +1,138 @@
+name: Deploy cb-user-service
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (dev | staging | prod)"
+        required: true
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "corretto"
+          cache: "maven"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+
+  deploy-dev:
+    name: Deploy → dev
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform deploy dev
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform apply -var-file=envs/dev.tfvars \
+            -var="image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
+            -auto-approve
+
+  deploy-staging:
+    name: Deploy → staging
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform deploy staging
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform apply -var-file=envs/staging.tfvars \
+            -var="image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
+            -auto-approve
+
+  deploy-prod:
+    name: Deploy → prod
+    needs: deploy-staging
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    environment: prod  # GitHub Environment with required reviewers = manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform deploy prod
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform apply -var-file=envs/prod.tfvars \
+            -var="image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
+            -auto-approve
